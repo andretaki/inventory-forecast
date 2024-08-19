@@ -1,122 +1,119 @@
 import pandas as pd
 import numpy as np
-from prophet import Prophet
-from prophet.diagnostics import cross_validation, performance_metrics
-from tqdm import tqdm
+from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
+from pytorch_forecasting.metrics import MAE, SMAPE, MAPE
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger
+import torch
 
-class SKUForecaster:
-    def __init__(self, data, forecast_periods=30):
-        self.data = data
-        self.forecast_periods = forecast_periods
-        self.models = {}
-        self.forecasts = {}
-        self.cv_results = {}
-        self.performance_metrics = {}
+class InventoryForecaster:
+    def __init__(self, data_loader, forecast_horizon=30, context_length=60):
+        self.data_loader = data_loader
+        self.forecast_horizon = forecast_horizon
+        self.context_length = context_length
+        self.model = None
+        self.training = None
+        self.validation = None
 
-    def prepare_data(self, sku):
-        df = self.data[[sku]].reset_index()
-        df.columns = ['ds', 'y']
-        return df
+    def prepare_data(self):
+        # Load and preprocess data
+        orders = self.data_loader.load_orders()
+        order_items = self.data_loader.load_order_items()
+        data = self.data_loader.preprocess_data(orders, order_items)
 
-    def train_models(self):
-        for sku in tqdm(self.data.columns, desc="Training models"):
-            df = self.prepare_data(sku)
-            model = Prophet(daily_seasonality=True)
-            model.fit(df)
-            self.models[sku] = model
+        # Create features
+        data['time_idx'] = (data['order_date'] - data['order_date'].min()).dt.days
+        data['month'] = data['order_date'].dt.month
+        data['year'] = data['order_date'].dt.year
+        data['day_of_week'] = data['order_date'].dt.dayofweek
 
-    def make_forecasts(self):
-        for sku, model in tqdm(self.models.items(), desc="Making forecasts"):
-            future = model.make_future_dataframe(periods=self.forecast_periods)
-            forecast = model.predict(future)
-            self.forecasts[sku] = forecast
+        # Split data into train and validation sets
+        train_data = data[data['order_date'] < '2023-01-01']
+        val_data = data[data['order_date'] >= '2023-01-01']
 
-    def get_forecast(self, sku):
-        if sku in self.forecasts:
-            return self.forecasts[sku][['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
-        else:
-            return None
+        # Create dataset
+        self.training = TimeSeriesDataSet(
+            train_data,
+            time_idx="time_idx",
+            target="quantity",
+            group_ids=["product"],
+            static_categoricals=["product"],
+            time_varying_known_reals=["month", "year", "day_of_week"],
+            time_varying_unknown_reals=["quantity"],
+            max_encoder_length=self.context_length,
+            max_prediction_length=self.forecast_horizon,
+        )
 
-    def get_purchase_recommendations(self, current_stock):
-        recommendations = {}
-        for sku, forecast in self.forecasts.items():
-            last_30_days = forecast['yhat'].tail(30).sum()
-            if sku in current_stock:
-                needed = max(0, last_30_days - current_stock[sku])
-                recommendations[sku] = needed
-            else:
-                recommendations[sku] = last_30_days
-        return recommendations
+        self.validation = TimeSeriesDataSet.from_dataset(self.training, val_data, stop_randomization=True)
 
-    def get_seasonal_components(self, sku):
-        if sku in self.models:
-            model = self.models[sku]
-            return model.component_modes()
-        else:
-            return None
+    def train_model(self, batch_size=64, max_epochs=100):
+        # Create dataloaders
+        train_dataloader = self.training.to_dataloader(train=True, batch_size=batch_size)
+        val_dataloader = self.validation.to_dataloader(train=False, batch_size=batch_size)
 
-    def perform_cross_validation(self, sku, initial='365 days', period='30 days', horizon='90 days'):
-        if sku in self.models:
-            df = self.prepare_data(sku)
-            cv_results = cross_validation(self.models[sku], initial=initial, period=period, horizon=horizon)
-            self.cv_results[sku] = cv_results
-            metrics = performance_metrics(cv_results)
-            self.performance_metrics[sku] = metrics
-            return metrics
-        else:
-            return None
+        # Configure the model
+        self.model = TemporalFusionTransformer.from_dataset(
+            self.training,
+            learning_rate=1e-3,
+            hidden_size=32,
+            attention_head_size=1,
+            dropout=0.1,
+            hidden_continuous_size=16,
+            loss=SMAPE(),
+            log_interval=10,
+            reduce_on_plateau_patience=4
+        )
 
-    def detect_anomalies(self, sku, threshold=0.05):
-        if sku in self.forecasts:
-            forecast = self.forecasts[sku]
-            observed = self.prepare_data(sku)
-            merged = forecast.merge(observed, on='ds', how='left')
-            merged['error'] = merged['y'] - merged['yhat']
-            merged['uncertainty'] = merged['yhat_upper'] - merged['yhat_lower']
-            merged['normalized_error'] = merged['error'] / merged['uncertainty']
-            anomalies = merged[abs(merged['normalized_error']) > threshold]
-            return anomalies
-        else:
-            return None
+        # Configure training
+        early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min")
+        lr_logger = LearningRateMonitor()
+        logger = TensorBoardLogger("lightning_logs")
 
-    def simulate_scenario(self, sku, scenario_func):
-        if sku in self.models:
-            model = self.models[sku]
-            future = model.make_future_dataframe(periods=self.forecast_periods)
-            future = scenario_func(future)
-            forecast = model.predict(future)
-            return forecast
-        else:
-            return None
+        trainer = pl.Trainer(
+            max_epochs=max_epochs,
+            gpus=0,  # Set to number of GPUs if available
+            gradient_clip_val=0.1,
+            callbacks=[early_stop_callback, lr_logger],
+            logger=logger,
+        )
 
-if __name__ == "__main__":
-    from data_loader import DataLoader
-    
-    loader = DataLoader()
-    data = loader.load_sku_history('2022-01-01', '2023-12-31')
-    processed_data = loader.preprocess_data(data)
-    
-    forecaster = SKUForecaster(processed_data)
-    forecaster.train_models()
-    forecaster.make_forecasts()
-    
-    sku_example = processed_data.columns[0]
-    
-    # Cross-validation example
-    cv_metrics = forecaster.perform_cross_validation(sku_example)
-    print(f"Cross-validation metrics for {sku_example}:")
-    print(cv_metrics)
-    
-    # Anomaly detection example
-    anomalies = forecaster.detect_anomalies(sku_example)
-    print(f"Detected anomalies for {sku_example}:")
-    print(anomalies)
-    
-    # Scenario simulation example
-    def increase_trend(future_df):
-        future_df['trend_increase'] = (future_df['ds'] - future_df['ds'].min()).dt.days * 0.1
-        return future_df
-    
-    scenario_forecast = forecaster.simulate_scenario(sku_example, increase_trend)
-    print(f"Scenario forecast for {sku_example}:")
-    print(scenario_forecast.tail())
+        # Fit the model
+        trainer.fit(
+            self.model,
+            train_dataloaders=train_dataloader,
+            val_dataloaders=val_dataloader,
+        )
+
+    def make_predictions(self, start_date, end_date):
+        # Load new data for prediction
+        new_data = self.data_loader.load_orders(start_date, end_date)
+        new_data = self.data_loader.preprocess_data(new_data, self.data_loader.load_order_items())
+
+        # Prepare features
+        new_data['time_idx'] = (new_data['order_date'] - new_data['order_date'].min()).dt.days
+        new_data['month'] = new_data['order_date'].dt.month
+        new_data['year'] = new_data['order_date'].dt.year
+        new_data['day_of_week'] = new_data['order_date'].dt.dayofweek
+
+        # Create a new dataset
+        predict_dataset = TimeSeriesDataSet.from_dataset(self.training, new_data, stop_randomization=True)
+        predict_dataloader = predict_dataset.to_dataloader(train=False, batch_size=128)
+
+        # Make predictions
+        predictions = self.model.predict(predict_dataloader)
+
+        # Convert predictions to DataFrame
+        pred_df = pd.DataFrame({
+            'product': new_data['product'].unique(),
+            'prediction': predictions.numpy().flatten()
+        })
+
+        return pred_df
+
+    def save_model(self, path):
+        torch.save(self.model.state_dict(), path)
+
+    def load_model(self, path):
+        self.model.load_state_dict(torch.load(path))
+

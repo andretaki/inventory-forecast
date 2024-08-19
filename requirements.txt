@@ -1,7 +1,39 @@
-pandas
-sqlalchemy
-python-dotenv
-prophet
-plotly
-streamlit
-tqdm
+# Data manipulation and analysis
+pandas==1.5.3
+numpy==1.24.3
+
+# Database connection
+SQLAlchemy==1.4.47
+psycopg2-binary==2.9.6
+
+# Machine learning and deep learning
+torch==2.0.1
+pytorch-lightning==2.0.2
+pytorch-forecasting==1.0.0
+
+# Data visualization
+matplotlib==3.7.1
+plotly==5.14.1
+
+# Web dashboard
+streamlit==1.22.0
+
+# Environment variable management
+python-dotenv==1.0.0
+
+# Logging (usually part of Python standard library, but listed for completeness)
+logging
+
+# Optional: for hyperparameter tuning
+optuna==3.1.1
+
+# Optional: for more advanced statistical analysis
+statsmodels==0.14.0
+
+# Optional: for working with dates and times
+pytz==2023.3
+
+# Development tools (optional)
+pytest==7.3.1
+black==23.3.0
+flake8==6.0.0
